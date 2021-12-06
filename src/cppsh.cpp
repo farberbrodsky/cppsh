@@ -31,8 +31,8 @@ out_pipe out_pipe::real_fd(int fd) {
     return res;
 }
 
-out_pipe out_pipe::to_stream(std::ostream &os) {
-    out_pipe res { cppsh::__out_pipe_type::out_pipe_stream };
+in_pipe in_pipe::to_stream(std::ostream &os) {
+    in_pipe res { cppsh::__in_pipe_type::in_pipe_stream };
     res.data.os = &os;
     return res;
 }
@@ -65,14 +65,16 @@ out_pipe &command::pipe_out_fd(int fd) {
 }
 
 // TODO throw exception if changing an existing input/output
-in_pipe &command::pipe_in_fd(int fd, const out_pipe &src) {
-    auto &pipe = this->pipe_in_fd(fd);
+in_pipe &command::pipe_in_fd(int fd, out_pipe &src) {
+    in_pipe &pipe = this->pipe_in_fd(fd);
     pipe.input = &src;
+    src.output = &pipe;
     return pipe;
 }
 
-out_pipe &command::pipe_out_fd(int fd, const in_pipe &dst) {
-    auto &pipe = this->pipe_out_fd(fd);
+out_pipe &command::pipe_out_fd(int fd, in_pipe &dst) {
+    out_pipe &pipe = this->pipe_out_fd(fd);
+    dst.input = &pipe;
     pipe.output = &dst;
     return pipe;
 }
@@ -97,9 +99,17 @@ command::~command() {
     delete[] this->argv;
 }
 
+static void write_errno_and_exit(int fd, std::string reason) {
+    // used by child process
+    std::string msg = std::to_string(errno) + " " + reason;
+    write(fd, msg.c_str(), msg.length());
+    exit(1);
+}
+
 // Heart of the library
 void command::run() {
     // Create in and out pipes
+    std::unordered_set<int> close_in_parent;   // pipe ends that the child will take over
     std::vector<std::pair<int, int>> set_fds;  // target fd, current fd
     std::unordered_set<int> dont_close;
 
@@ -108,13 +118,54 @@ void command::run() {
         const in_pipe *out = pair.second->output;
 
         if (out->type == cppsh::__in_pipe_type::in_pipe_fd) {
-            set_fds.push_back(std::make_pair(fd, out->data.fd));
+            set_fds.emplace_back(fd, out->data.fd);
             dont_close.emplace(out->data.fd);
         } else if (out->type == cppsh::__in_pipe_type::in_pipe_proc) {
             if (out->data.proc.owner->running) {
-                // TODO do stuff
+                // take the output's write end
+                int write_end_fd = out->data.proc.write_end_fd;
+
+                set_fds.emplace_back(fd, write_end_fd);
+                dont_close.emplace(write_end_fd);
+                close_in_parent.emplace(write_end_fd);
             } else {
-                // TODO do stuff
+                // create a pipe and when the other process runs it will take our read end
+                int pipefd[2];
+                if (pipe2(pipefd, 0) != 0) throw std::system_error(errno, std::system_category(), "couldn't create pipe");
+                pair.second->data.proc.read_end_fd = pipefd[0];
+
+                // set the write end to be our desired file descriptor
+                set_fds.emplace_back(fd, pipefd[1]);
+                dont_close.emplace(pipefd[1]);
+                close_in_parent.emplace(pipefd[1]);
+            }
+        } else {
+            // TODO ...
+        }
+    }
+    for (auto &pair : this->in_pipes) {
+        int fd = pair.first;
+        const out_pipe *in = pair.second->input;
+        if (in->type == cppsh::__out_pipe_type::out_pipe_fd) {
+            set_fds.emplace_back(fd, in->data.fd);
+            dont_close.emplace(in->data.fd);
+        } else if (in->type == cppsh::__out_pipe_type::out_pipe_proc) {
+            if (in->data.proc.owner->running) {
+                // take the input's read end
+                int read_end_fd = in->data.proc.read_end_fd;
+                set_fds.emplace_back(fd, read_end_fd);
+                dont_close.emplace(read_end_fd);
+                close_in_parent.emplace(read_end_fd);
+            } else {
+                // create a pipe and when the other process runs it will take our write end
+                int pipefd[2];
+                if (pipe2(pipefd, 0) != 0) throw std::system_error(errno, std::system_category(), "couldn't create pipe");
+                pair.second->data.proc.write_end_fd = pipefd[1];
+
+                // set the read end to be our desired file descriptor
+                set_fds.emplace_back(fd, pipefd[0]);
+                dont_close.emplace(pipefd[0]);
+                close_in_parent.emplace(pipefd[0]);
             }
         }
     }
@@ -123,6 +174,7 @@ void command::run() {
     int pipefd[2];
     if (pipe2(pipefd, O_CLOEXEC) != 0) throw std::system_error(errno, std::system_category(), "couldn't create pipe");
 
+    this->running = true;
     this->child_pid = fork();
     if (this->child_pid == 0) {
         using std::to_string;
@@ -143,42 +195,64 @@ void command::run() {
             }
         }
 
+        // make max_fd bigger than every file descriptor that should exist
+        for (auto [target_fd, curr_fd] : set_fds) {
+            if (target_fd > max_fd) max_fd = target_fd;
+            if (curr_fd > max_fd) max_fd = curr_fd;
+        }
+
         for (int fd : close_soon) {
             close(fd);
         }
 
         // move to target fds
-        for (auto [target_fd, curr_fd] : set_fds) {
+        dont_close.clear();  // will store file descriptors that are mapped to themselves, e.g. 1 to 1
+        close_soon.clear();  // will store file descriptors that have been dup'd to another place and aren't needed
+        for (auto it = set_fds.begin(); it != set_fds.end(); ++it) {
+            auto [target_fd, curr_fd] = *it;
+
             if (curr_fd != target_fd) {
                 if (target_fd == pipefd[1]) {
                     // move pipefd[1] somewhere else that isn't in use
-                    int new_pipefd = dup3(pipefd[1], max_fd + 1, O_CLOEXEC);
-                    if (new_pipefd == -1) {
-                        // report this error
-                        std::string msg = to_string(errno) + " dup3";
-                        write(pipefd[1], msg.c_str(), msg.length());
-                        exit(1);
-                    } else {
-                        pipefd[1] = new_pipefd;
-                    }
+                    int new_pipefd = dup3(pipefd[1], ++max_fd, O_CLOEXEC);
+                    if (new_pipefd == -1) write_errno_and_exit(pipefd[1], "dup3");
+
+                    pipefd[1] = new_pipefd;
                 }
-                if (dup2(curr_fd, target_fd) == -1) {
-                    // report this error
-                    std::string msg = to_string(errno) + " dup2";
-                    write(pipefd[1], msg.c_str(), msg.length());
-                    exit(1);
-                };
-                close(curr_fd);
+
+                // move curr_fd somewhere else
+                if (dup2(curr_fd, ++max_fd) == -1) write_errno_and_exit(pipefd[1], "dup2");
+                close_soon.push_back(curr_fd);  // don't close now because it might get used too
+                it->second = max_fd;
+            } else {
+                dont_close.emplace(curr_fd);
             }
+        }
+
+        // close everything in close_soon that isn't in dont_close
+        for (int fd : close_soon) {
+            if (dont_close.count(fd) == 0) {
+                close(fd);
+            }
+        }
+
+        // duplicate fds to their targets
+        for (auto [target_fd, curr_fd] : set_fds) {
+            if (dup2(curr_fd, target_fd) == -1) write_errno_and_exit(pipefd[1], "dup2");
+            if (dont_close.count(curr_fd) == 0) close(curr_fd);
         }
 
         execv(this->argv[0], this->argv);
         // execv has failed, report this error
-        std::string msg = to_string(errno) + " execve";
-        write(pipefd[1], msg.c_str(), msg.length());
-        exit(1);
+        write_errno_and_exit(pipefd[1], "execve");
+
     } else if (this->child_pid > 0) {
         close(pipefd[1]);  // close the write end
+
+        for (int fd : close_in_parent) {
+            close(fd);
+        }
+
         char buf[512];
         size_t count = read(pipefd[0], buf, sizeof(buf));
         close(pipefd[0]);
@@ -209,17 +283,18 @@ int command::wait() {
 }
 
 int main() {
-    command c { "/usr/bin/cat", "/proc/version" };
-    c.pipe_out_fd(1, in_pipe::real_fd(1));
-    c.pipe_out_fd(2, in_pipe::real_fd(2));
-    c.run();
-    int w = c.wait();
-    std::cout << "\n";
-    if (WIFEXITED(w)) std::cout << "exited: " << WEXITSTATUS(w) << "\n";
-    if (WIFSIGNALED(w)) std::cout << "signaled: " << WTERMSIG(w) << "\n";
-    if (WCOREDUMP(w)) std::cout << "core dumped\n";
-    if (WIFSTOPPED(w)) std::cout << "stopped: " << WSTOPSIG(w) << "\n";
-    if (WIFCONTINUED(w)) std::cout << "continued\n";
-    std::cout << std::flush;
+    command cat { "/usr/bin/cat", "/etc/os-release" };
+    command grep { "/usr/bin/grep", "PRETTY_NAME" };
+    auto _stdout = in_pipe::real_fd(1);
+    auto _stderr = in_pipe::real_fd(2);
+
+    cat.pipe_out_fd(1, grep.pipe_in_fd(0)); // equivalent: sh.pipe_in_fd(0, c.pipe_out_fd(1));
+    grep.pipe_out_fd(1, _stdout);  // just passes the file descriptor as is
+    grep.pipe_out_fd(2, _stderr);
+    grep.run();
+    cat.run();
+
+    cat.wait();
+    grep.wait();
     return 0;
 }
