@@ -20,7 +20,7 @@ namespace cppsh {
     class out_pipe;
     class in_pipe {
         friend command;
-        const out_pipe *input = NULL;
+        out_pipe *input = NULL;
         __in_pipe_type type;
 
         union {
@@ -39,8 +39,9 @@ namespace cppsh {
         in_pipe(__in_pipe_type type);
 
     public:
+        ~in_pipe();
         static in_pipe real_fd(int fd);
-        static in_pipe to_stream(std::ostream &os);  // TODO not fully implemented
+        static in_pipe to_stream(std::ostream &os);
     };
 
 
@@ -51,7 +52,7 @@ namespace cppsh {
 
     class out_pipe {
         friend command;
-        const in_pipe *output = NULL;
+        in_pipe *output = NULL;
         __out_pipe_type type;
 
         union {
@@ -66,6 +67,7 @@ namespace cppsh {
         out_pipe(__out_pipe_type type);
 
     public:
+        ~out_pipe();
         static out_pipe real_fd(int fd);
     };
 
@@ -79,6 +81,7 @@ namespace cppsh {
         int argc;
         char **argv;
         pid_t child_pid;
+        bool run_once = false;  // used to check you don't run a command twice
 
     public:
         bool running = false;
@@ -112,6 +115,22 @@ namespace cppsh {
     class command_not_running : public std::logic_error {
     public:
         command_not_running(): std::logic_error { "Waiting for command but command is not running" } {}
+    };
+
+    class command_already_run : public std::logic_error {
+    public:
+        command_already_run(): std::logic_error { "Command already ran once, it can't run again" } {}
+    };
+
+
+    class pipe_set_twice : public std::logic_error {
+    public:
+        pipe_set_twice(): std::logic_error { "Pipe was set twice" } {}
+    };
+
+    class pipe_not_set : public std::logic_error {
+    public:
+        pipe_not_set(): std::logic_error { "Pipe was not set" } {}
     };
 }
 

@@ -38,6 +38,20 @@ in_pipe in_pipe::to_stream(std::ostream &os) {
     return res;
 }
 
+in_pipe::~in_pipe() {
+    if (this->type == cppsh::__in_pipe_type::in_pipe_proc && this->data.proc.write_end_fd != -1) {
+        close(this->data.proc.write_end_fd);
+    } else if (this->type == cppsh::__in_pipe_type::in_pipe_stream) {
+        close(this->data.to_stream.memfd);
+    }
+}
+
+out_pipe::~out_pipe() {
+    if (this->type == cppsh::__out_pipe_type::out_pipe_proc && this->data.proc.read_end_fd != -1) {
+        close(this->data.proc.read_end_fd);
+    }
+}
+
 
 in_pipe &command::pipe_in_fd(int fd) {
     auto &value = this->in_pipes[fd];
@@ -65,9 +79,12 @@ out_pipe &command::pipe_out_fd(int fd) {
     }
 }
 
-// TODO throw exception if changing an existing input/output
 in_pipe &command::pipe_in_fd(int fd, out_pipe &src) {
     in_pipe &pipe = this->pipe_in_fd(fd);
+    if (pipe.input != nullptr || src.output != nullptr) {
+        throw cppsh::pipe_set_twice {};
+    }
+
     pipe.input = &src;
     src.output = &pipe;
     return pipe;
@@ -75,6 +92,10 @@ in_pipe &command::pipe_in_fd(int fd, out_pipe &src) {
 
 out_pipe &command::pipe_out_fd(int fd, in_pipe &dst) {
     out_pipe &pipe = this->pipe_out_fd(fd);
+    if (pipe.output != nullptr || dst.input != nullptr) {
+        throw cppsh::pipe_set_twice {};
+    }
+
     dst.input = &pipe;
     pipe.output = &dst;
     return pipe;
@@ -118,6 +139,10 @@ static void write_errno_and_exit(int fd, std::string reason) {
 
 // Heart of the library
 void command::run() {
+    if (this->run_once) {
+        throw cppsh::command_already_run {};
+    }
+
     // Create in and out pipes
     std::unordered_set<int> close_in_parent;   // pipe ends that the child will take over
     std::vector<std::pair<int, int>> set_fds;  // target fd, current fd
@@ -125,7 +150,10 @@ void command::run() {
 
     for (auto &pair : this->out_pipes) {
         int fd = pair.first;
-        const in_pipe *out = pair.second->output;
+        in_pipe *out = pair.second->output;
+        if (out == nullptr) {
+            throw cppsh::pipe_not_set {};
+        }
 
         if (out->type == cppsh::__in_pipe_type::in_pipe_fd) {
             set_fds.emplace_back(fd, out->data.fd);
@@ -137,6 +165,7 @@ void command::run() {
             if (out->data.proc.owner->running) {
                 // take the output's write end
                 int write_end_fd = out->data.proc.write_end_fd;
+                out->data.proc.write_end_fd = -1;
 
                 set_fds.emplace_back(fd, write_end_fd);
                 dont_close.emplace(write_end_fd);
@@ -156,7 +185,11 @@ void command::run() {
     }
     for (auto &pair : this->in_pipes) {
         int fd = pair.first;
-        const out_pipe *in = pair.second->input;
+        out_pipe *in = pair.second->input;
+        if (in == nullptr) {
+            throw cppsh::pipe_not_set {};
+        }
+
         if (in->type == cppsh::__out_pipe_type::out_pipe_fd) {
             set_fds.emplace_back(fd, in->data.fd);
             dont_close.emplace(in->data.fd);
@@ -164,6 +197,8 @@ void command::run() {
             if (in->data.proc.owner->running) {
                 // take the input's read end
                 int read_end_fd = in->data.proc.read_end_fd;
+                in->data.proc.read_end_fd = -1;
+
                 set_fds.emplace_back(fd, read_end_fd);
                 dont_close.emplace(read_end_fd);
                 close_in_parent.emplace(read_end_fd);
@@ -186,6 +221,7 @@ void command::run() {
     if (pipe2(pipefd, O_CLOEXEC) != 0) throw std::system_error(errno, std::system_category(), "couldn't create pipe");
 
     this->running = true;
+    this->run_once = true;
     this->child_pid = fork();
     if (this->child_pid == 0) {
         using std::to_string;
@@ -295,10 +331,11 @@ int command::wait() {
             this->running = false;
         }
 
-        // read from memfds into streams and close
+        // read from memfds into streams
+        // they are closed by their destructors
         char buf[4096];
         for (auto &[fd, pipe_ptr] : this->out_pipes) {
-            const in_pipe *output = pipe_ptr->output;
+            in_pipe *output = pipe_ptr->output;
             if (output->type == cppsh::__in_pipe_type::in_pipe_stream) {
                 int memfd = output->data.to_stream.memfd;
                 lseek(memfd, 0, SEEK_SET);
@@ -307,8 +344,6 @@ int command::wait() {
                 while ((count = read(memfd, buf, sizeof(buf))) > 0) {
                     *(output->data.to_stream.os) << std::string_view { buf, count };
                 }
-
-                close(memfd);
             }
         }
 
@@ -320,7 +355,6 @@ int command::wait() {
 
 int main() {
     for (int i = 0; i < 10; i++) {
-        // sleep(5);
         std::stringstream ss {};
         in_pipe store_to_s = in_pipe::to_stream(ss);
 
