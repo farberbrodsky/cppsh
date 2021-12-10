@@ -30,7 +30,10 @@ namespace cppsh {
                 int write_end_fd;
             } proc;  // in_pipe_proc
             int fd;  // in_pipe_fd
-            std::ostream *os;  // in_pipe_stream
+            struct {
+                int memfd;
+                std::ostream *os;
+            } to_stream;  // in_pipe_stream
         } data;
 
         in_pipe(__in_pipe_type type);
@@ -75,10 +78,11 @@ namespace cppsh {
 
         int argc;
         char **argv;
-        bool running = false;
         pid_t child_pid;
 
     public:
+        bool running = false;
+
         command(std::initializer_list<std::string_view> args);
         ~command();
 
@@ -103,6 +107,11 @@ namespace cppsh {
     class command_not_found : public std::runtime_error {
     public:
         command_not_found(char *name): std::runtime_error { std::string { "command not found: " } + name } {}
+    };
+
+    class command_not_running : public std::logic_error {
+    public:
+        command_not_running(): std::logic_error { "Waiting for command but command is not running" } {}
     };
 }
 

@@ -1,12 +1,12 @@
 #include "cppsh.hpp"
 #include <vector>
-#include <iostream>  // debugging only
-#include <filesystem>
+#include <iostream>    // debugging only
+#include <filesystem>  // /proc/self/fd/
 #include <unordered_set>
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/wait.h>
-#include <sys/types.h>
+#include <fcntl.h>     // O_CLOEXEC
+#include <unistd.h>    // pipe2
+#include <sys/wait.h>  // waitpid
+#include <sys/mman.h>  // memfd_create
 
 using cppsh::in_pipe;
 using cppsh::out_pipe;
@@ -33,7 +33,8 @@ out_pipe out_pipe::real_fd(int fd) {
 
 in_pipe in_pipe::to_stream(std::ostream &os) {
     in_pipe res { cppsh::__in_pipe_type::in_pipe_stream };
-    res.data.os = &os;
+    res.data.to_stream.memfd = memfd_create("pipe", 0);
+    res.data.to_stream.os = &os;
     return res;
 }
 
@@ -86,6 +87,7 @@ command::command(std::initializer_list<std::string_view> args) {
     for (auto it = args.begin(); it != args.end(); ++it) {
         argv[i] = new char[it->size() + 1];
         it->copy(argv[i], it->size());
+        argv[i][it->size()] = '\0';
         i++;
     }
     argv[i] = NULL;
@@ -97,6 +99,14 @@ command::~command() {
     }
 
     delete[] this->argv;
+
+    if (this->running) {
+        // kill the subprocess
+        do {
+            kill(this->child_pid, SIGKILL);
+            this->wait();
+        } while (this->running);
+    }
 }
 
 static void write_errno_and_exit(int fd, std::string reason) {
@@ -120,6 +130,9 @@ void command::run() {
         if (out->type == cppsh::__in_pipe_type::in_pipe_fd) {
             set_fds.emplace_back(fd, out->data.fd);
             dont_close.emplace(out->data.fd);
+        } else if (out->type == cppsh::__in_pipe_type::in_pipe_stream) {
+            set_fds.emplace_back(fd, out->data.to_stream.memfd);
+            dont_close.emplace(out->data.to_stream.memfd);
         } else if (out->type == cppsh::__in_pipe_type::in_pipe_proc) {
             if (out->data.proc.owner->running) {
                 // take the output's write end
@@ -139,8 +152,6 @@ void command::run() {
                 dont_close.emplace(pipefd[1]);
                 close_in_parent.emplace(pipefd[1]);
             }
-        } else {
-            // TODO ...
         }
     }
     for (auto &pair : this->in_pipes) {
@@ -260,7 +271,7 @@ void command::run() {
             throw std::system_error(errno, std::system_category(), "reading from pipe");
         } else if (count != 0) {
             // throw the exception that was sent
-            std::string msg { buf };
+            std::string msg { buf, count };
 
             int err = std::stoi(msg);
             msg = msg.substr(msg.find(' ') + 1);
@@ -277,24 +288,55 @@ void command::run() {
 }
 
 int command::wait() {
-    int wstatus;
-    waitpid(this->child_pid, &wstatus, 0);
-    return wstatus;
+    if (this->running) {
+        int wstatus;
+        waitpid(this->child_pid, &wstatus, 0);
+        if (WIFEXITED(wstatus) || WIFSIGNALED(wstatus) || WIFSTOPPED(wstatus)) {
+            this->running = false;
+        }
+
+        // read from memfds into streams and close
+        char buf[4096];
+        for (auto &[fd, pipe_ptr] : this->out_pipes) {
+            const in_pipe *output = pipe_ptr->output;
+            if (output->type == cppsh::__in_pipe_type::in_pipe_stream) {
+                int memfd = output->data.to_stream.memfd;
+                lseek(memfd, 0, SEEK_SET);
+
+                size_t count;
+                while ((count = read(memfd, buf, sizeof(buf))) > 0) {
+                    *(output->data.to_stream.os) << std::string_view { buf, count };
+                }
+
+                close(memfd);
+            }
+        }
+
+        return wstatus;
+    } else {
+        throw command_not_running {};
+    }
 }
 
 int main() {
-    command cat { "/usr/bin/cat", "/etc/os-release" };
-    command grep { "/usr/bin/grep", "PRETTY_NAME" };
-    auto _stdout = in_pipe::real_fd(1);
-    auto _stderr = in_pipe::real_fd(2);
+    for (int i = 0; i < 10; i++) {
+        // sleep(5);
+        std::stringstream ss {};
+        in_pipe store_to_s = in_pipe::to_stream(ss);
 
-    cat.pipe_out_fd(1, grep.pipe_in_fd(0)); // equivalent: sh.pipe_in_fd(0, c.pipe_out_fd(1));
-    grep.pipe_out_fd(1, _stdout);  // just passes the file descriptor as is
-    grep.pipe_out_fd(2, _stderr);
-    grep.run();
-    cat.run();
+        command cat { "/usr/bin/echo", "-e", "abc\nworld\nthis\nworks\nhello world\nasdf" };
+        command grep { "/usr/bin/grep", "hello" };
 
-    cat.wait();
-    grep.wait();
+        cat.pipe_out_fd(1, grep.pipe_in_fd(0)); // equivalent: grep.pipe_in_fd(0, cat.pipe_out_fd(1));
+        grep.pipe_out_fd(1, store_to_s);
+        grep.run();
+        cat.run();
+
+        while (cat.running) cat.wait();
+        while (grep.running) grep.wait();
+
+        std::cout << "Output of commands is: " << ss.str() << std::flush;
+    }
+
     return 0;
 }
